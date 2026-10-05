@@ -1,5 +1,5 @@
 import { router } from 'expo-router';
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -13,6 +13,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { openAuthSessionAsync } from 'expo-web-browser';
+import * as Linking from 'expo-linking';
 
 import { BottomTabInset, Spacing } from '@/constants/theme';
 import {
@@ -401,6 +402,15 @@ export default function CheckoutScreen() {
   const [paymentError, setPaymentError] = useState<string | null>(null);
   const [pendingOrder, setPendingOrder] = useState<PendingOrder | null>(null);
 
+  /**
+   * Settles a payment attempt exactly once.
+   *
+   * The auth-session promise and the deep-link listener below race: whichever
+   * observes the Paystack return first drives verification, the other becomes
+   * a no-op. Reset at the start of every `payForOrder` attempt.
+   */
+  const settledRef = useRef(false);
+
   const goBack = useCallback(() => {
     if (router.canGoBack()) router.back();
     else router.replace('/shop');
@@ -508,16 +518,65 @@ export default function CheckoutScreen() {
   );
 
   /**
+   * Handles a Paystack return deep link (`demolscakesmobile://checkout/result`).
+   *
+   * This is the same return the auth-session promise watches for, reached here
+   * through the OS Linking event instead — on Android the session is a Custom
+   * Tab + Linking polyfill, so the promise can resolve as dismiss/cancel even
+   * when the payment succeeded. The deep link itself is only ever a hint;
+   * `verifyAndFinalize` (server truth) decides everything, exactly as on the
+   * promise path. Deep links for any other order are ignored as stale.
+   */
+  const handleDeepLinkReturn = useCallback(
+    async (url: string, order: PendingOrder) => {
+      if (!url.startsWith(PAYMENT_RETURN_URL)) return;
+      if (settledRef.current) return;
+
+      let linkedOrderId: string | null = null;
+      let hintReason: string | null = null;
+      try {
+        const params = new URL(url).searchParams;
+        linkedOrderId = params.get('orderId');
+        hintReason = params.get('reason');
+      } catch {
+        return;
+      }
+
+      // A failed payment carries no order id; a success for another order is
+      // stale — either way, only this attempt's order may proceed.
+      if (linkedOrderId && linkedOrderId !== order.orderId) return;
+      settledRef.current = true;
+
+      try {
+        await verifyAndFinalize(order, hintReason);
+      } finally {
+        setPaying(false);
+      }
+    },
+    [verifyAndFinalize]
+  );
+
+  /**
    * Opens Paystack for an already-created order and verifies afterwards.
    *
    * Cancelling or dismissing the browser leaves the cart untouched. This never
-   * creates an order — it only continues the one `submit()` already made.
+   * creates an order — it only continues the one `submit()` already made. The
+   * return is observed two ways (auth-session promise + deep-link listener);
+   * `settledRef` guarantees exactly one of them drives verification.
    */
   const payForOrder = useCallback(
     async (order: PendingOrder) => {
       if (paying) return;
       setPaymentError(null);
       setPaying(true);
+      settledRef.current = false;
+
+      // Capture the return even when the auth-session promise does not
+      // resolve it as success-with-url (notably the Android Custom Tab
+      // polyfill). Removed when this attempt settles.
+      const subscription = Linking.addEventListener('url', ({ url }) => {
+        void handleDeepLinkReturn(url, order);
+      });
 
       try {
         const browserResult = await openAuthSessionAsync(
@@ -525,10 +584,15 @@ export default function CheckoutScreen() {
           PAYMENT_RETURN_URL
         );
 
+        // The deep-link listener already drove verification.
+        if (settledRef.current) return;
+        settledRef.current = true;
+
         if (browserResult.type !== 'success' || !browserResult.url) {
           setPaymentError(
             'Payment was not completed. Your cart is unchanged — you can try again when ready.'
           );
+          setPaying(false);
           return;
         }
 
@@ -541,16 +605,25 @@ export default function CheckoutScreen() {
           hintReason = null;
         }
 
-        await verifyAndFinalize(order, hintReason);
+        try {
+          await verifyAndFinalize(order, hintReason);
+        } finally {
+          setPaying(false);
+        }
       } catch {
+        // The listener may have won while the open call threw; never
+        // overwrite a driven outcome with an open failure.
+        if (settledRef.current) return;
+        settledRef.current = true;
         setPaymentError(
           "We couldn't open the payment page. Check your connection and try again."
         );
-      } finally {
         setPaying(false);
+      } finally {
+        subscription.remove();
       }
     },
-    [paying, verifyAndFinalize]
+    [paying, verifyAndFinalize, handleDeepLinkReturn]
   );
 
   /** Re-checks the pending order without reopening Paystack. */
